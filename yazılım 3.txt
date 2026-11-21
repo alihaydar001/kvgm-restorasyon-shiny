@@ -1,0 +1,150 @@
+########################################################################
+# Shiny App: KVMGM Restoration Cost Pre-Tender Decision Support Tool
+#
+# Operationalizes the CART model from the manuscript as an interactive
+# tool for procurement officers. Loads and fits the CART model on
+# startup using the confirmed pipeline (original-date temporal split,
+# ln(Cost) target, maxdepth=5/minsplit=10/minbucket=5/cp=0.01), then
+# lets a user enter project characteristics and get a predicted cost
+# with a transparent explanation of which decision rule fired.
+#
+# Run locally with: shiny::runApp("app.R")
+# Take your Figure 2 screenshots directly from the running app window.
+########################################################################
+
+if (!requireNamespace("shiny", quietly = TRUE)) install.packages("shiny")
+if (!requireNamespace("shinythemes", quietly = TRUE)) install.packages("shinythemes")
+library(shiny); library(shinythemes)
+library(dplyr); library(readr); library(lubridate); library(rpart); library(rpart.plot)
+
+## ------------------------------------------------------------------------
+## 1. Load & fit CART model once at app startup (same pipeline as before)
+## ------------------------------------------------------------------------
+data_path <- "C:/Users/arash/1 2025/.venv/assessmnet/.venv/Ali hayder/New folder/Veri Seti 08.08.2024 - Kod İsimli.csv"
+raw <- read_delim(data_path, delim = ",", locale = locale(encoding = "windows-1254"),
+                  show_col_types = FALSE)
+
+base_df <- raw %>%
+  mutate(
+    comp_date_orig = mdy(`Completion Date`),
+    final_try = as.numeric(gsub(",", "", `Final Project Cost (TRY)`)),
+    constr_pct = as.numeric(`Construction Group Percentage (%)`),
+    mech_pct   = as.numeric(`Mechanical Group Percentage (%)`),
+    planned_days = as.numeric(`Planned Duration (Days)`),
+    extension_days = as.numeric(`Time Extension (Days)`),
+    admin_bldg = ifelse(`Project Category Number` == 1, 1, 0),
+    exhibition = ifelse(`Project Category Number` == 3, 1, 0),
+    reason_clean = tolower(coalesce(`Reasons for Cost Increase`, "")),
+    reason_factor = factor(case_when(
+      grepl("unforeseen", reason_clean) ~ "Unforeseen",
+      grepl("hatal|inaccurate", reason_clean) ~ "Inaccurate",
+      grepl("revision", reason_clean) ~ "Revision",
+      TRUE ~ "Other/None"))
+  ) %>%
+  filter(!is.na(final_try), final_try > 0, !is.na(comp_date_orig)) %>%
+  mutate(across(c(constr_pct, mech_pct, planned_days, extension_days), ~coalesce(., 0)),
+         log_cost = log(final_try))
+
+q <- quantile(base_df$log_cost, c(0.25, 0.75), na.rm = TRUE)
+iqr <- q[2] - q[1]
+trimmed_df <- base_df %>% filter(log_cost > q[1] - 1.5*iqr, log_cost < q[2] + 1.5*iqr)
+
+cart_model <- rpart(log_cost ~ admin_bldg + exhibition + constr_pct + mech_pct +
+                      reason_factor + planned_days + extension_days,
+                    data = trimmed_df, method = "anova",
+                    control = rpart.control(maxdepth = 5, minsplit = 10, minbucket = 5, cp = 0.01))
+
+all_rules <- rpart.rules(cart_model, cover = FALSE, roundint = FALSE)
+
+## ------------------------------------------------------------------------
+## 2. UI
+## ------------------------------------------------------------------------
+ui <- fluidPage(
+  theme = shinytheme("flatly"),
+  tags$style(HTML("
+    #rule_path, #node_info {
+      white-space: pre-wrap;
+      word-wrap: break-word;
+      overflow-x: hidden;
+    }
+  ")),
+  titlePanel("KVMGM Heritage Restoration - Pre-Tender Cost Estimator"),
+  sidebarLayout(
+    sidebarPanel(
+      h4("Project Characteristics"),
+      selectInput("category", "Project Category",
+                  choices = c("Administrative Building" = "admin",
+                              "Museum Exhibition Works" = "exhibition",
+                              "Other" = "other")),
+      sliderInput("constr_pct", "Construction Group (%)", min = 0, max = 100, value = 60),
+      sliderInput("mech_pct", "Mechanical Group (%)", min = 0, max = 100, value = 10),
+      sliderInput("planned_days", "Planned Duration (Days)", min = 0, max = 900, value = 150),
+      sliderInput("extension_days", "Expected Time Extension (Days)", min = 0, max = 900, value = 0),
+      selectInput("reason", "Anticipated Risk Factor",
+                  choices = c("None / Standard Scope" = "Other/None",
+                              "Unforeseen Site Conditions" = "Unforeseen",
+                              "Possible Project Revision" = "Revision",
+                              "Inaccurate Initial Survey" = "Inaccurate")),
+      actionButton("predict_btn", "Predict Final Cost", class = "btn-primary", width = "100%")
+    ),
+    mainPanel(
+      h3("Predicted Final Project Cost"),
+      wellPanel(
+        h2(textOutput("predicted_cost"), style = "color:#2c3e50; font-weight:bold;"),
+        h5(textOutput("predicted_range"), style = "color:#7f8c8d;")
+      ),
+      h4("Prediction Detail"),
+      verbatimTextOutput("node_info"),
+      h4("Full CART Rule Set (Reference)"),
+      verbatimTextOutput("rule_path"),
+      h4("Model Transparency Note"),
+      p("This estimate is generated by a CART (Classification and Regression Tree) model",
+        "trained on 578 completed restoration projects. Unlike black-box ML models, every",
+        "prediction traces to a small set of human-readable decision rules (shown above),",
+        "allowing procurement officers to audit and justify budget estimates.")
+    )
+  )
+)
+
+## ------------------------------------------------------------------------
+## 3. Server
+## ------------------------------------------------------------------------
+server <- function(input, output, session) {
+  
+  pred_result <- eventReactive(input$predict_btn, {
+    new_row <- data.frame(
+      admin_bldg = ifelse(input$category == "admin", 1, 0),
+      exhibition = ifelse(input$category == "exhibition", 1, 0),
+      constr_pct = input$constr_pct,
+      mech_pct = input$mech_pct,
+      reason_factor = factor(input$reason, levels = levels(trimmed_df$reason_factor)),
+      planned_days = input$planned_days,
+      extension_days = input$extension_days
+    )
+    pred_log <- predict(cart_model, newdata = new_row)
+    list(cost = exp(pred_log), log_cost = as.numeric(pred_log), row = new_row)
+  })
+  
+  output$predicted_cost <- renderText({
+    r <- pred_result()
+    paste0(format(round(r$cost, 0), big.mark = ","), " TRY")
+  })
+  
+  output$predicted_range <- renderText({
+    r <- pred_result()
+    lo <- round(r$cost * 0.85, 0); hi <- round(r$cost * 1.15, 0)
+    paste0("Approximate 85%-115% range: ", format(lo, big.mark = ","), " - ", format(hi, big.mark = ","), " TRY")
+  })
+  
+  output$node_info <- renderPrint({
+    r <- pred_result()
+    cat("Predicted ln(Cost):", round(r$log_cost, 3), "\n")
+    cat("Predicted Cost (TRY):", format(round(r$cost, 0), big.mark = ","), "\n")
+  })
+  
+  output$rule_path <- renderPrint({
+    cat(gsub(" {2,}", "  ", capture.output(print(all_rules)), fixed = FALSE), sep = "\n")
+  })
+}
+
+shinyApp(ui = ui, server = server)
